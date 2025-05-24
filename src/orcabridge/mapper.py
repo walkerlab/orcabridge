@@ -1,8 +1,17 @@
-from typing import Callable, Dict, Optional, List, Sequence
-
-from .stream import SyncStream, SyncStreamFromGenerator
-from .base import Operation
-from .utils.stream_utils import (
+from typing import (
+    Callable,
+    Dict,
+    Optional,
+    List,
+    Sequence,
+    Tuple,
+    Iterator,
+    Collection,
+    Any,
+)
+from orcabridge.base import Operation, SyncStream, Mapper
+from orcabridge.stream import SyncStreamFromGenerator
+from orcabridge.utils.stream_utils import (
     join_tags,
     check_packet_compatibility,
     batch_tag,
@@ -10,15 +19,7 @@ from .utils.stream_utils import (
 )
 from .hashing import hash_function
 from .types import Tag, Packet
-from typing import Iterator, Tuple, Any, Collection
 from itertools import chain
-
-
-class Mapper(Operation):
-    """
-    A Mapper is an operation that does NOT generate new file content.
-    It is used to control the flow of data in the pipeline without modifying or creating new data (file).
-    """
 
 
 class Repeat(Mapper):
@@ -599,16 +600,14 @@ class CacheStream(Mapper):
         self.is_cached = False
 
     def forward(self, *streams: SyncStream) -> SyncStream:
-        if len(streams) != 1:
+        if not self.is_cached and len(streams) != 1:
             raise ValueError(
                 "CacheStream operation requires exactly one stream"
             )
 
-        stream = streams[0]
-
         def generator() -> Iterator[Tuple[Tag, Packet]]:
             if not self.is_cached:
-                for tag, packet in stream:
+                for tag, packet in streams[0]:
                     self.cache.append((tag, packet))
                     yield tag, packet
                 self.is_cached = True
