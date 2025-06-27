@@ -3,20 +3,22 @@ from collections.abc import Callable, Collection, Iterator
 from itertools import chain
 from typing import Any
 
-
-from orcapod.core.base import Operator, SyncStream
+from orcapod.types import Packet, Tag, TypeSpec
 from orcapod.hashing import function_content_hash, hash_function
+from orcapod.core.base import Kernel, SyncStream, Operator
 from orcapod.core.streams import SyncStreamFromGenerator
 from orcapod.utils.stream_utils import (
     batch_packet,
     batch_tags,
     check_packet_compatibility,
+    intersection_typespecs,
     join_tags,
-    fill_missing,
-    merge_typespecs,
+    semijoin_tags,
+    union_typespecs,
+    intersection_typespecs,
+    fill_missing
 )
 
-from orcapod.types import Packet, Tag, TypeSpec
 
 
 class Repeat(Operator):
@@ -186,11 +188,42 @@ class Merge(Operator):
 
         return True
 
+def union_lists(left, right):
+    if left is None or right is None:
+        return None
+    output = list(left)
+    for item in right:
+        if item not in output:
+            output.append(item)
+    return output
+                  
 
 class Join(Operator):
     def identity_structure(self, *streams):
         # Join does not depend on the order of the streams -- convert it onto a set
         return (self.__class__.__name__, set(streams))
+
+    def keys(
+        self, *streams: SyncStream, trigger_run=False
+    ) -> tuple[Collection[str] | None, Collection[str] | None]:
+        """
+        Returns the types of the operation.
+        The first list contains the keys of the tags, and the second list contains the keys of the packets.
+        The keys are returned if it is feasible to do so, otherwise a tuple
+        (None, None) is returned to signify that the keys are not known.
+        """
+        if len(streams) != 2:
+            raise ValueError("Join operation requires exactly two streams")
+
+        left_stream, right_stream = streams
+        left_tag_keys, left_packet_keys = left_stream.keys(trigger_run=trigger_run)
+        right_tag_keys, right_packet_keys = right_stream.keys(trigger_run=trigger_run)
+
+        # TODO: do error handling when merge fails
+        joined_tag_keys = union_lists(left_tag_keys, right_tag_keys)
+        joined_packet_keys = union_lists(left_packet_keys, right_packet_keys)
+
+        return joined_tag_keys, joined_packet_keys
 
     def types(
         self, *streams: SyncStream, trigger_run=False
@@ -209,8 +242,8 @@ class Join(Operator):
         right_tag_types, right_packet_types = right_stream.types(trigger_run=False)
 
         # TODO: do error handling when merge fails
-        joined_tag_types = merge_typespecs(left_tag_types, right_tag_types)
-        joined_packet_types = merge_typespecs(left_packet_types, right_packet_types)
+        joined_tag_types = union_typespecs(left_tag_types, right_tag_types)
+        joined_packet_types = union_typespecs(left_packet_types, right_packet_types)
 
         return joined_tag_types, joined_packet_types
 
@@ -225,8 +258,11 @@ class Join(Operator):
         left_stream, right_stream = streams
 
         def generator() -> Iterator[tuple[Tag, Packet]]:
-            for left_tag, left_packet in left_stream:
-                for right_tag, right_packet in right_stream:
+            # using list comprehension rather than list() to avoid call to __len__ which is expensive
+            left_stream_buffered = [e for e in left_stream]
+            right_stream_buffered = [e for e in right_stream]
+            for left_tag, left_packet in left_stream_buffered:
+                for right_tag, right_packet in right_stream_buffered:
                     if (joined_tag := join_tags(left_tag, right_tag)) is not None:
                         if not check_packet_compatibility(left_packet, right_packet):
                             raise ValueError(
@@ -338,8 +374,8 @@ class FirstMatch(Operator):
         ):
             return super().types(*streams, trigger_run=trigger_run)
 
-        joined_tag_types = merge_typespecs(left_tag_types, right_tag_types)
-        joined_packet_types = merge_typespecs(left_packet_types, right_packet_types)
+        joined_tag_types = union_typespecs(left_tag_types, right_tag_types)
+        joined_packet_types = union_typespecs(left_packet_types, right_packet_types)
 
         return joined_tag_types, joined_packet_types
 
@@ -400,7 +436,12 @@ class MapPackets(Operator):
         stream = streams[0]
         tag_keys, packet_keys = stream.keys(trigger_run=trigger_run)
         if tag_keys is None or packet_keys is None:
-            return super().keys(trigger_run=trigger_run)
+            super_tag_keys, super_packet_keys =  super().keys(trigger_run=trigger_run)
+            tag_keys = tag_keys or super_tag_keys
+            packet_keys = packet_keys or super_packet_keys
+
+        if packet_keys is None:
+            return tag_keys, packet_keys
 
         if self.drop_unmapped:
             # If drop_unmapped is True, we only keep the keys that are in the mapping
@@ -426,7 +467,12 @@ class MapPackets(Operator):
         stream = streams[0]
         tag_types, packet_types = stream.types(trigger_run=trigger_run)
         if tag_types is None or packet_types is None:
-            return super().types(trigger_run=trigger_run)
+            super_tag_types, super_packet_types = super().types(trigger_run=trigger_run)
+            tag_types = tag_types or super_tag_types
+            packet_types = packet_types or super_packet_types
+
+        if packet_types is None:
+            return tag_types, packet_types
 
         if self.drop_unmapped:
             # If drop_unmapped is True, we only keep the keys that are in the mapping
@@ -550,6 +596,68 @@ class MapTags(Operator):
 
         return mapped_tag_keys, packet_keys
 
+class SemiJoin(Operator):
+    """
+    Perform semi-join on the left stream tags with the tags of the right stream
+    """
+    def identity_structure(self, *streams):
+        # Restrict DOES depend on the order of the streams -- maintain as a tuple
+        return (self.__class__.__name__,) + streams
+
+    def keys(
+        self, *streams: SyncStream, trigger_run=False
+    ) -> tuple[Collection[str] | None, Collection[str] | None]:
+        """
+        For semijoin, output keys and types are identical to left stream
+        """
+        if len(streams) != 2:
+            raise ValueError("Join operation requires exactly two streams")
+
+        return streams[0].keys(trigger_run=trigger_run)
+
+    def types(
+        self, *streams: SyncStream, trigger_run=False
+    ) -> tuple[TypeSpec | None, TypeSpec | None]:
+        """
+        For semijoin, output keys and types are identical to left stream
+        """
+        if len(streams) != 2:
+            raise ValueError("Join operation requires exactly two streams")
+
+        return streams[0].types(trigger_run=trigger_run)
+
+    def forward(self, *streams: SyncStream) -> SyncStream:
+        """
+        Joins two streams together based on their tags.
+        The resulting stream will contain all the tags from both streams.
+        """
+        if len(streams) != 2:
+            raise ValueError("Join operation requires exactly two streams")
+
+        left_stream, right_stream = streams
+        left_tag_typespec, left_packet_typespec = left_stream.types()
+        right_tag_typespec, right_packet_typespec = right_stream.types()
+
+        common_tag_typespec = intersection_typespecs(left_tag_typespec, right_tag_typespec)
+        common_tag_keys = None
+        if common_tag_typespec is not None:
+            common_tag_keys = list(common_tag_typespec.keys())
+
+        def generator() -> Iterator[tuple[Tag, Packet]]:
+            # using list comprehension rather than list() to avoid call to __len__ which is expensive
+            left_stream_buffered = [e for e in left_stream]
+            right_stream_buffered = [e for e in right_stream]
+            for left_tag, left_packet in left_stream_buffered:
+                for right_tag, _ in right_stream_buffered:
+                    if semijoin_tags(left_tag, right_tag, common_tag_keys) is not None:
+                        yield left_tag, left_packet
+                        # move onto next entry
+                        break
+
+        return SyncStreamFromGenerator(generator)
+
+    def __repr__(self) -> str:
+        return "SemiJoin()"
 
 class Filter(Operator):
     """

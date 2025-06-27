@@ -1,4 +1,67 @@
-from orcapod.core.base import Invocation, Kernel, Tracker
+from orcapod.core.base import Invocation, Kernel, Tracker, SyncStream, Source
+from orcapod.types import Tag, Packet, TypeSpec
+from collections.abc import Collection, Iterator
+from typing import Any
+
+class StreamWrapper(SyncStream):
+    """
+    A wrapper for a SyncStream that allows it to be used as a Source.
+    This is useful for cases where you want to treat a stream as a source
+    without modifying the original stream.
+    """
+
+    def __init__(self, stream: SyncStream, **kwargs):
+        super().__init__(**kwargs)
+        self.stream = stream
+
+    def keys(self, *streams: SyncStream, **kwargs) -> tuple[Collection[str]|None, Collection[str]|None]:
+        return self.stream.keys(*streams, **kwargs)
+
+    def types(self, *streams: SyncStream, **kwargs) -> tuple[TypeSpec|None, TypeSpec|None]:
+        return self.stream.types(*streams, **kwargs)
+    
+    def computed_label(self) -> str | None:
+        return self.stream.label
+
+    def __iter__(self) -> Iterator[tuple[Tag, Packet]]:
+        """
+        Iterate over the stream, yielding tuples of (tags, packets).
+        """
+        yield from self.stream
+        
+    
+
+class StreamSource(Source):
+    def __init__(self, stream: SyncStream, **kwargs):
+        super().__init__(skip_tracking=True, **kwargs)
+        self.stream = stream
+
+    def forward(self, *streams: SyncStream) -> SyncStream:
+        if len(streams) != 0:
+            raise ValueError(
+                "StreamSource does not support forwarding streams. "
+                "It generates its own stream from the file system."
+            )
+        return StreamWrapper(self.stream)
+    
+    def identity_structure(self, *streams) -> Any:
+        if len(streams) != 0:
+            raise ValueError(
+                "StreamSource does not support forwarding streams. "
+                "It generates its own stream from the file system."
+            )
+         
+        return (self.__class__.__name__, self.stream)
+
+    def types(self, *streams: SyncStream, **kwargs) -> tuple[TypeSpec|None, TypeSpec|None]:
+        return self.stream.types()
+    
+    def keys(self, *streams: SyncStream, **kwargs) -> tuple[Collection[str]|None, Collection[str]|None]:
+        return self.stream.keys()
+
+    def computed_label(self) -> str | None:
+        return self.stream.label
+    
 
 
 class GraphTracker(Tracker):
@@ -44,6 +107,7 @@ class GraphTracker(Tracker):
 
     def generate_graph(self):
         import networkx as nx
+
         G = nx.DiGraph()
 
         # Add edges for each invocation
@@ -51,15 +115,20 @@ class GraphTracker(Tracker):
             for invocation in invocations:
                 for upstream in invocation.streams:
                     # if upstream.invocation is not in the graph, add it
-                    if upstream.invocation not in G:
-                        G.add_node(upstream.invocation)
-                    G.add_edge(upstream.invocation, invocation, stream=upstream)
+                    upstream_invocation = upstream.invocation
+                    if upstream_invocation is None:
+                        # If upstream is None, create a stub kernel
+                        upstream_invocation = Invocation(StreamSource(upstream), [])
+                    if upstream_invocation not in G:
+                        G.add_node(upstream_invocation)
+                    G.add_edge(upstream_invocation, invocation, stream=upstream)
 
         return G
 
     def draw_graph(self):
         import networkx as nx
         import matplotlib.pyplot as plt
+
         G = self.generate_graph()
         labels = self.generate_namemap()
 

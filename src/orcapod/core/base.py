@@ -1,11 +1,14 @@
-# Collection of base classes for operations and streams in the orcabridge framework.
+# Collection of base classes for operations and streams in the orcapod framework.
 import threading
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Collection, Iterator
-from typing import Any, TypeVar, Hashable
+from typing import Any
 
 
-from orcapod.hashing import HashableMixin
+from orcapod.hashing import HashableMixin, ObjectHasher
+from orcapod.hashing import get_default_object_hasher
+
+from orcapod.hashing import ContentIdentifiableBase
 from orcapod.types import Packet, Tag, TypeSpec
 from orcapod.utils.stream_utils import get_typespec
 
@@ -15,7 +18,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 
-class Kernel(ABC, HashableMixin):
+class Kernel(ABC, ContentIdentifiableBase):
     """
     Kernel defines the fundamental unit of computation that can be performed on zero, one or more streams of data.
     It is the base class for all computations and transformations that can be performed on a collection of streams
@@ -27,42 +30,56 @@ class Kernel(ABC, HashableMixin):
     for computational graph tracking.
     """
 
-    def __init__(self, label: str | None = None, **kwargs) -> None:
+    def __init__(
+        self, label: str | None = None, skip_tracking: bool = False, **kwargs
+    ) -> None:
         super().__init__(**kwargs)
         self._label = label
+        self._skip_tracking = skip_tracking
 
-    @property
-    def label(self) -> str:
+    def pre_forward_hook(
+        self, *streams: "SyncStream", **kwargs
+    ) -> tuple["SyncStream", ...]:
         """
-        Returns a human-readable label for this kernel.
-        Default implementation returns the provided label or class name if no label was provided.
+        A hook that is called before the forward method is invoked.
+        This can be used to perform any pre-processing or validation on the input streams.
+        Subclasses can override this method to provide custom behavior.
         """
-        if self._label:
-            return self._label
-        return self.__class__.__name__
+        return streams
 
-    @label.setter
-    def label(self, label: str) -> None:
-        self._label = label
+    def post_forward_hook(self, output_stream: "SyncStream", **kwargs) -> "SyncStream":
+        """
+        A hook that is called after the forward method is invoked.
+        This can be used to perform any post-processing on the output stream.
+        Subclasses can override this method to provide custom behavior.
+        """
+        return output_stream
 
-    def __call__(self, *streams: "SyncStream", **kwargs) -> "SyncStream":
+    def __call__(
+        self, *streams: "SyncStream", label: str | None = None, **kwargs
+    ) -> "SyncStream":
+        if label is not None:
+            self.label = label
         # Special handling of Source: trigger call on source if passed as stream
         normalized_streams = [
             stream() if isinstance(stream, Source) else stream for stream in streams
         ]
 
-        output_stream = self.forward(*normalized_streams, **kwargs)
+        pre_processed_streams = self.pre_forward_hook(*normalized_streams, **kwargs)
+        output_stream = self.forward(*pre_processed_streams, **kwargs)
+        post_processed_stream = self.post_forward_hook(output_stream, **kwargs)
         # create an invocation instance
-        invocation = Invocation(self, normalized_streams)
+        invocation = Invocation(self, pre_processed_streams)
         # label the output_stream with the invocation that produced the stream
-        output_stream.invocation = invocation
+        post_processed_stream.invocation = invocation
 
-        # register the invocation to all active trackers
-        active_trackers = Tracker.get_active_trackers()
-        for tracker in active_trackers:
-            tracker.record(invocation)
+        if not self._skip_tracking:
+            # register the invocation to all active trackers
+            active_trackers = Tracker.get_active_trackers()
+            for tracker in active_trackers:
+                tracker.record(invocation)
 
-        return output_stream
+        return post_processed_stream
 
     @abstractmethod
     def forward(self, *streams: "SyncStream") -> "SyncStream":
@@ -98,7 +115,7 @@ class Kernel(ABC, HashableMixin):
         logger.warning(
             f"Identity structure not implemented for {self.__class__.__name__}"
         )
-        return (self.__class__.__name__,) + tuple(streams)
+        return (self.__class__.__name__,) + streams
 
     def keys(
         self, *streams: "SyncStream", trigger_run: bool = False
@@ -204,7 +221,7 @@ class Tracker(ABC):
 
 # This is NOT an abstract class, but rather a concrete class that
 # represents an invocation of a kernel on a collection of streams.
-class Invocation(HashableMixin):
+class Invocation(ContentIdentifiableBase):
     """
     This class represents an invocation of a kernel on a collection of streams.
     It contains the kernel and the streams that were used in the invocation.
@@ -217,23 +234,24 @@ class Invocation(HashableMixin):
         kernel: Kernel,
         # TODO: technically this should be Stream to stay consistent with Stream interface. Update to Stream when AsyncStream is implemented
         streams: Collection["SyncStream"],
+        **kwargs,
     ) -> None:
+        super().__init__(**kwargs)
         self.kernel = kernel
         self.streams = streams
 
-    def __hash__(self) -> int:
-        return super().__hash__()
+    def computed_label(self) -> str | None:
+        """
+        Returns the computed label for this invocation.
+        This is used to provide a default label if no label is set.
+        """
+        return self.kernel.label
 
     def __repr__(self) -> str:
         return f"Invocation(kernel={self.kernel}, streams={self.streams})"
 
     def __str__(self) -> str:
         return f"Invocation[ID:{self.__hash__()}]({self.kernel}, {self.streams})"
-
-    def __eq__(self, other: Any) -> bool:
-        if not isinstance(other, Invocation):
-            return False
-        return hash(self) == hash(other)
 
     def __lt__(self, other: Any) -> bool:
         if not isinstance(other, Invocation):
@@ -271,7 +289,7 @@ class Invocation(HashableMixin):
         return self.kernel.identity_structure(*self.streams)
 
 
-class Stream(ABC, HashableMixin):
+class Stream(ABC, ContentIdentifiableBase):
     """
     A stream is a collection of tagged-packets that are generated by an operation.
     The stream is iterable and can be used to access the packets in the stream.
@@ -280,35 +298,15 @@ class Stream(ABC, HashableMixin):
     This may be None if the stream is not generated by a kernel (i.e. directly instantiated by a user).
     """
 
-    def __init__(self, label: str | None = None, **kwargs) -> None:
+    def __init__(self, **kwargs) -> None:
         super().__init__(**kwargs)
         self._invocation: Invocation | None = None
-        self._label = label
 
-    @property
-    def label(self) -> str:
-        """
-        Returns a human-readable label for this stream.
-        If no label is provided and the stream is generated by an operation,
-        the label of the operation is used.
-        Otherwise, the class name is used as the label.
-        """
-        if self._label is None:
-            if self.invocation is not None:
-                # use the invocation operation label
-                return self.invocation.kernel.label
-            else:
-                return self.__class__.__name__
-        return self._label
-
-    @label.setter
-    def label(self, label: str) -> None:
-        """
-        Sets a human-readable label for this stream.
-        """
-        if not isinstance(label, str):
-            raise TypeError("label must be a string")
-        self._label = label
+    def computed_label(self) -> str | None:
+        if self.invocation is not None:
+            # use the invocation operation label
+            return self.invocation.kernel.label
+        return None
 
     @property
     def invocation(self) -> Invocation | None:
@@ -329,7 +327,7 @@ class Stream(ABC, HashableMixin):
         Flow everything through the stream, returning the entire collection of
         (Tag, Packet) as a collection. This will tigger any upstream computation of the stream.
         """
-        return list(self)
+        return [e for e in self]
 
     # --------------------- Recursive methods ---------------------------
     # These methods form a step in the multi-class recursive invocation that follows the pattern of
@@ -365,6 +363,8 @@ class Stream(ABC, HashableMixin):
             tag_keys, packet_keys = self.invocation.keys()
             if tag_keys is not None and packet_keys is not None:
                 return tag_keys, packet_keys
+        if not trigger_run:
+            return None, None
         # otherwise, use the keys from the first packet in the stream
         # note that this may be computationally expensive
         tag, packet = next(iter(self))
@@ -386,6 +386,8 @@ class Stream(ABC, HashableMixin):
             tag_types, packet_types = self.invocation.types()
             if not trigger_run or (tag_types is not None and packet_types is not None):
                 return tag_types, packet_types
+        if not trigger_run:
+            return None, None
         # otherwise, use the keys from the first packet in the stream
         # note that this may be computationally expensive
         tag, packet = next(iter(self))
@@ -432,6 +434,68 @@ class SyncStream(Stream):
         """
         return sum(1 for _ in self)
 
+    def join(self, other: "SyncStream", label: str | None = None) -> "SyncStream":
+        """
+        Returns a new stream that is the result of joining with the other stream.
+        The join is performed on the tags of the packets in the streams.
+        """
+        from .operators import Join
+
+        if not isinstance(other, SyncStream):
+            raise TypeError("other must be a SyncStream")
+        return Join(label=label)(self, other)
+
+    def semijoin(self, other: "SyncStream", label: str | None = None) -> "SyncStream":
+        """
+        Returns a new stream that is the result of semijoining with the other stream.
+        The semijoin is performed on the tags of the packets in the streams.
+        """
+        from .operators import SemiJoin
+
+        if not isinstance(other, SyncStream):
+            raise TypeError("other must be a SyncStream")
+        return SemiJoin(label=label)(self, other)
+
+    def map(
+        self,
+        packet_map: dict | None = None,
+        tag_map: dict | None = None,
+        drop_unmapped: bool = True,
+    ) -> "SyncStream":
+        """
+        Returns a new stream that is the result of mapping the packets and tags in the stream.
+        The mapping is applied to each packet in the stream and the resulting packets
+        are returned in a new stream.
+        If packet_map is None, no mapping is applied to the packets.
+        If tag_map is None, no mapping is applied to the tags.
+        """
+        from .operators import MapTags, MapPackets
+
+        output = self
+        if packet_map is not None:
+            output = MapPackets(packet_map, drop_unmapped=drop_unmapped)(output)
+        if tag_map is not None:
+            output = MapTags(tag_map, drop_unmapped=drop_unmapped)(output)
+
+        return output
+
+    def apply(self, transformer: "dict | Operator") -> "SyncStream":
+        """
+        Returns a new stream that is the result of applying the mapping to the stream.
+        The mapping is applied to each packet in the stream and the resulting packets
+        are returned in a new stream.
+        """
+        from .operators import MapPackets
+
+        if isinstance(transformer, dict):
+            return MapPackets(transformer)(self)
+        elif isinstance(transformer, Operator):
+            # If the transformer is an Operator, we can apply it directly
+            return transformer(self)
+
+        # Otherwise, do not know how to handle the transformer
+        raise TypeError("transformer must be a dictionary or an operator")
+
     def __rshift__(
         self, transformer: dict | Callable[["SyncStream"], "SyncStream"]
     ) -> "SyncStream":
@@ -440,7 +504,6 @@ class SyncStream(Stream):
         The mapping is applied to each packet in the stream and the resulting packets
         are returned in a new stream.
         """
-        # TODO: remove just in time import
         from .operators import MapPackets
 
         if isinstance(transformer, dict):
@@ -457,7 +520,6 @@ class SyncStream(Stream):
         """
         Returns a new stream that is the result joining with the other stream
         """
-        # TODO: remove just in time import
         from .operators import Join
 
         if not isinstance(other, SyncStream):

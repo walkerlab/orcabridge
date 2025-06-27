@@ -1,5 +1,4 @@
 #!/usr/bin/env python
-# filepath: /home/eywalker/workspace/orcabridge/tests/test_store/test_dir_data_store.py
 """Tests for DirDataStore."""
 
 import json
@@ -14,7 +13,7 @@ from orcapod.hashing.types import (
     PacketHasher,
     PathSetHasher,
 )
-from orcapod.store.core import DirDataStore
+from orcapod.store.dict_data_stores import DirDataStore
 
 
 class MockFileHasher(FileHasher):
